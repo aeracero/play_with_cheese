@@ -8,7 +8,7 @@
 - `requirements.txt` : 依存ライブラリ
 
 ## 設定（message_limit.py の冒頭）
-- `TARGET_USER_IDS` : 制限対象のユーザーID
+- `TARGET_USER_IDS` : 制限対象のユーザーID（`/limittarget add` でも追加可）
 - `AUTHORIZED_USER_IDS` : コマンドを使える人のID
 - `DAILY_LIMIT` / `ROULETTE_MIN` / `ROULETTE_MAX` / `MAX_CHARS`
 
@@ -16,6 +16,7 @@
 - `/roulette [user] [min] [max]` : 今日の上限回数をランダムで決定
 - `/charlimit chars` : 最大文字数を設定（0で無制限）
 - `/limitstatus` : 今日の使用状況
+- `/limittarget add|remove|list` : 制限対象ユーザーの管理
 - `/limitadmin add|remove|list` : 使用者の管理
 
 ## Railway へのデプロイ

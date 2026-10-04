@@ -6,6 +6,7 @@ message_limit.py - 特定ユーザーの発言を制限する Cog (discord.py 2.
   - /roulette  : 今日の上限回数をランダムで決定
   - 文字数制限  : 超過したメッセージを自動削除（/charlimit で変更可）
   - 操作できるのは AUTHORIZED_USER_IDS と /limitadmin add で追加した人のみ
+  - 制限対象は TARGET_USER_IDS（埋め込み）と /limittarget add で追加した人
 
 必要な権限: Manage Messages / View Channels / Send Messages / Read Message History
 必要な intent: Message Content Intent（文字数制限に必要。Developer Portal でも有効化）
@@ -44,6 +45,9 @@ class MessageLimit(commands.Cog):
     limitadmin = app_commands.Group(
         name="limitadmin", description="コマンドを使える人を管理します"
     )
+    limittarget = app_commands.Group(
+        name="limittarget", description="制限対象のユーザーを管理します"
+    )
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -60,9 +64,15 @@ class MessageLimit(commands.Cog):
                 key TEXT PRIMARY KEY, value INTEGER);
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS targets (
+                user_id INTEGER PRIMARY KEY);
             """
         )
         self.db.commit()
+        # 制限対象（埋め込み + コマンド追加分）。メッセージごとのDB参照を避けるためキャッシュ
+        self._db_targets: set[int] = {
+            r[0] for r in self.db.execute("SELECT user_id FROM targets")
+        }
         self._notified: set[tuple[int, str]] = set()
 
     def cog_unload(self):
@@ -101,6 +111,9 @@ class MessageLimit(commands.Cog):
         row = self.db.execute("SELECT value FROM settings WHERE key='max_chars'").fetchone()
         return row[0] if row else MAX_CHARS
 
+    def _target_ids(self) -> set[int]:
+        return TARGET_USER_IDS | self._db_targets
+
     def _db_admin_ids(self) -> set[int]:
         return {r[0] for r in self.db.execute("SELECT user_id FROM admins")}
 
@@ -120,7 +133,7 @@ class MessageLimit(commands.Cog):
         if message.author.bot or message.guild is None:
             return
         uid = message.author.id
-        if uid not in TARGET_USER_IDS:
+        if uid not in self._target_ids():
             return
 
         # 1) 文字数制限（超過分は回数にカウントしない）
@@ -188,15 +201,21 @@ class MessageLimit(commands.Cog):
             return
 
         if user is not None:
-            if user.id not in TARGET_USER_IDS:
+            if user.id not in self._target_ids():
                 await interaction.response.send_message(
-                    "このユーザーは制限対象ではありません（TARGET_USER_IDS に追加してください）。",
+                    "このユーザーは制限対象ではありません（/limittarget add で追加できます）。",
                     ephemeral=True,
                 )
                 return
             targets = [user.id]
         else:
-            targets = sorted(TARGET_USER_IDS)
+            targets = sorted(self._target_ids())
+            if not targets:
+                await interaction.response.send_message(
+                    "制限対象のユーザーがいません（/limittarget add で追加してください）。",
+                    ephemeral=True,
+                )
+                return
 
         date = today()
         lines = []
@@ -231,13 +250,65 @@ class MessageLimit(commands.Cog):
         max_chars = self._get_max_chars()
         lines = [
             f"<@{uid}>: 今日 {self._get_count(uid, date)} / {self._get_limit(uid, date)} 件"
-            for uid in sorted(TARGET_USER_IDS)
+            for uid in sorted(self._target_ids())
         ]
         lines.append(f"文字数制限: {'なし' if max_chars == 0 else f'{max_chars}文字'}")
         await interaction.response.send_message(
             "\n".join(lines),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # ---------- target management ----------
+    @limittarget.command(name="add", description="制限対象のユーザーを追加します")
+    @app_commands.describe(user="追加するユーザー")
+    async def target_add(self, interaction: discord.Interaction, user: discord.User):
+        if not await self._guard(interaction):
+            return
+        if user.bot:
+            await interaction.response.send_message(
+                "botは制限対象にできません。", ephemeral=True
+            )
+            return
+        self.db.execute("INSERT OR IGNORE INTO targets (user_id) VALUES (?)", (user.id,))
+        self.db.commit()
+        self._db_targets.add(user.id)
+        await interaction.response.send_message(
+            f"{user.mention} を制限対象に追加しました。",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @limittarget.command(name="remove", description="追加した制限対象を外します")
+    @app_commands.describe(user="外すユーザー")
+    async def target_remove(self, interaction: discord.Interaction, user: discord.User):
+        if not await self._guard(interaction):
+            return
+        if user.id in TARGET_USER_IDS:
+            await interaction.response.send_message(
+                "コードに埋め込まれたユーザーはコマンドから外せません"
+                "（TARGET_USER_IDS を編集してください）。",
+                ephemeral=True,
+            )
+            return
+        self.db.execute("DELETE FROM targets WHERE user_id=?", (user.id,))
+        self.db.commit()
+        self._db_targets.discard(user.id)
+        await interaction.response.send_message(
+            f"{user.mention} を制限対象から外しました。",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @limittarget.command(name="list", description="制限対象の一覧を表示します")
+    async def target_list(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        fixed = [f"- <@{u}>（埋め込み）" for u in sorted(TARGET_USER_IDS)]
+        added = [f"- <@{u}>" for u in sorted(self._db_targets - TARGET_USER_IDS)]
+        text = "\n".join(fixed + added) or "制限対象のユーザーはいません。"
+        await interaction.response.send_message(
+            text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
         )
 
     # ---------- admin management ----------
