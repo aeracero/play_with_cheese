@@ -12,11 +12,13 @@
 - `AUTHORIZED_USER_IDS` : コマンドを使える人のID
 - `DAILY_LIMIT` / `ROULETTE_MIN` / `ROULETTE_MAX` / `MAX_CHARS`
 
-## コマンド（AUTHORIZED_USER_IDS と /limitadmin add の人のみ）
+## コマンド（AUTHORIZED_USER_IDS と /limitadmin add の人のみ。/roulette は準アドミンも可）
 - `/roulette [user] [min] [max]` : 今日の上限回数をランダムで決定
 - `/charlimit chars` : 最大文字数を設定（0で無制限）
 - `/limitstatus` : 今日の使用状況
 - `/limittarget add|remove|list` : 制限対象ユーザーの管理
+- `/subadmin add|remove|list` : 準アドミン（/rouletteだけ使える人）の管理
+- `/subadmin config [allow_custom] [min] [max]` : 準アドミンの範囲指定の可否と範囲を設定
 - `/limitadmin add|remove|list` : 使用者の管理
 
 ## Railway へのデプロイ

@@ -7,6 +7,7 @@ message_limit.py - 特定ユーザーの発言を制限する Cog (discord.py 2.
   - 文字数制限  : 超過したメッセージを自動削除（/charlimit で変更可）
   - 操作できるのは AUTHORIZED_USER_IDS と /limitadmin add で追加した人のみ
   - 制限対象は TARGET_USER_IDS（埋め込み）と /limittarget add で追加した人
+  - 準アドミン: /roulette だけ使える人。範囲指定の可否と固定範囲はアドミンが /subadmin config で設定
 
 必要な権限: Manage Messages / View Channels / Send Messages / Read Message History
 必要な intent: Message Content Intent（文字数制限に必要。Developer Portal でも有効化）
@@ -16,6 +17,7 @@ import os
 import random
 import sqlite3
 from datetime import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import discord
@@ -45,6 +47,10 @@ class MessageLimit(commands.Cog):
     limitadmin = app_commands.Group(
         name="limitadmin", description="コマンドを使える人を管理します"
     )
+    subadmin = app_commands.Group(
+        name="subadmin",
+        description="準アドミン（/rouletteだけ使える人）を管理します",
+    )
     limittarget = app_commands.Group(
         name="limittarget", description="制限対象のユーザーを管理します"
     )
@@ -65,6 +71,8 @@ class MessageLimit(commands.Cog):
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS targets (
+                user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS sub_admins (
                 user_id INTEGER PRIMARY KEY);
             """
         )
@@ -111,6 +119,26 @@ class MessageLimit(commands.Cog):
         row = self.db.execute("SELECT value FROM settings WHERE key='max_chars'").fetchone()
         return row[0] if row else MAX_CHARS
 
+    def _get_setting(self, key: str, default: int) -> int:
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def _set_setting(self, key: str, value: int) -> None:
+        self.db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        self.db.commit()
+
+    def _sub_admin_ids(self) -> set[int]:
+        return {r[0] for r in self.db.execute("SELECT user_id FROM sub_admins")}
+
+    def _sub_custom_allowed(self) -> bool:
+        return bool(self._get_setting("sub_custom_allowed", 0))
+
+    def _sub_range(self) -> tuple[int, int]:
+        return (
+            self._get_setting("sub_min", ROULETTE_MIN),
+            self._get_setting("sub_max", ROULETTE_MAX),
+        )
+
     def _target_ids(self) -> set[int]:
         return TARGET_USER_IDS | self._db_targets
 
@@ -118,9 +146,12 @@ class MessageLimit(commands.Cog):
         return {r[0] for r in self.db.execute("SELECT user_id FROM admins")}
 
     # ---------- permission ----------
+    def _is_admin(self, uid: int) -> bool:
+        return uid in AUTHORIZED_USER_IDS or uid in self._db_admin_ids()
+
     async def _guard(self, interaction: discord.Interaction) -> bool:
-        uid = interaction.user.id
-        if uid in AUTHORIZED_USER_IDS or uid in self._db_admin_ids():
+        """アドミン専用コマンド用のチェック"""
+        if self._is_admin(interaction.user.id):
             return True
         await interaction.response.send_message(
             "このコマンドを使う権限がありません。", ephemeral=True
@@ -181,20 +212,40 @@ class MessageLimit(commands.Cog):
     @app_commands.command(name="roulette", description="今日の上限回数をランダムで決めます")
     @app_commands.describe(
         user="対象ユーザー（省略すると制限対象の全員）",
-        minimum=f"最小回数（デフォルト {ROULETTE_MIN}）",
-        maximum=f"最大回数（デフォルト {ROULETTE_MAX}）",
+        minimum="最小回数（省略時はデフォルトの範囲）",
+        maximum="最大回数（省略時はデフォルトの範囲）",
     )
     @app_commands.rename(minimum="min", maximum="max")
     async def roulette(
         self,
         interaction: discord.Interaction,
         user: discord.Member | None = None,
-        minimum: app_commands.Range[int, 0, 1000] = ROULETTE_MIN,
-        maximum: app_commands.Range[int, 0, 1000] = ROULETTE_MAX,
+        minimum: Optional[app_commands.Range[int, 0, 1000]] = None,
+        maximum: Optional[app_commands.Range[int, 0, 1000]] = None,
     ):
-        if not await self._guard(interaction):
+        uid = interaction.user.id
+        is_admin = self._is_admin(uid)
+        if not is_admin and uid not in self._sub_admin_ids():
+            await interaction.response.send_message(
+                "このコマンドを使う権限がありません。", ephemeral=True
+            )
             return
-        if minimum > maximum:
+
+        note = ""
+        if is_admin:
+            lo = minimum if minimum is not None else ROULETTE_MIN
+            hi = maximum if maximum is not None else ROULETTE_MAX
+        else:
+            sub_lo, sub_hi = self._sub_range()
+            if self._sub_custom_allowed():
+                lo = minimum if minimum is not None else sub_lo
+                hi = maximum if maximum is not None else sub_hi
+            else:
+                lo, hi = sub_lo, sub_hi
+                if minimum is not None or maximum is not None:
+                    note = "\n（範囲指定は許可されていないため、固定範囲を使用しました）"
+
+        if lo > hi:
             await interaction.response.send_message(
                 "min は max 以下にしてください。", ephemeral=True
             )
@@ -219,12 +270,12 @@ class MessageLimit(commands.Cog):
 
         date = today()
         lines = []
-        for uid in targets:
-            n = random.randint(minimum, maximum)
-            self._set_limit(uid, date, n)
-            lines.append(f"<@{uid}> の今日の上限は **{n}件** に決まりました！")
+        for tid in targets:
+            n = random.randint(lo, hi)
+            self._set_limit(tid, date, n)
+            lines.append(f"<@{tid}> の今日の上限は **{n}件** に決まりました！")
         await interaction.response.send_message(
-            "🎰 ルーレット結果（" + f"{minimum}〜{maximum}）\n" + "\n".join(lines),
+            f"🎰 ルーレット結果（{lo}〜{hi}）\n" + "\n".join(lines) + note,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -257,6 +308,80 @@ class MessageLimit(commands.Cog):
             "\n".join(lines),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # ---------- sub-admin management ----------
+    @subadmin.command(name="add", description="準アドミン（/rouletteだけ使える人）を追加します")
+    @app_commands.describe(user="追加するユーザー")
+    async def subadmin_add(self, interaction: discord.Interaction, user: discord.User):
+        if not await self._guard(interaction):
+            return
+        self.db.execute("INSERT OR IGNORE INTO sub_admins (user_id) VALUES (?)", (user.id,))
+        self.db.commit()
+        await interaction.response.send_message(
+            f"{user.mention} を準アドミンに追加しました。",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @subadmin.command(name="remove", description="準アドミンを外します")
+    @app_commands.describe(user="外すユーザー")
+    async def subadmin_remove(self, interaction: discord.Interaction, user: discord.User):
+        if not await self._guard(interaction):
+            return
+        self.db.execute("DELETE FROM sub_admins WHERE user_id=?", (user.id,))
+        self.db.commit()
+        await interaction.response.send_message(
+            f"{user.mention} を準アドミンから外しました。",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @subadmin.command(name="list", description="準アドミンの一覧と現在の設定を表示します")
+    async def subadmin_list(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        lo, hi = self._sub_range()
+        members = "\n".join(f"- <@{u}>" for u in sorted(self._sub_admin_ids())) or "- （なし）"
+        mode = "許可（自由に指定可）" if self._sub_custom_allowed() else "禁止（固定範囲のみ）"
+        await interaction.response.send_message(
+            f"準アドミン:\n{members}\n\n範囲指定: {mode}\n準アドミンの範囲: {lo}〜{hi}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @subadmin.command(name="config", description="準アドミンの/rouletteの範囲設定を変更します")
+    @app_commands.describe(
+        allow_custom="準アドミンが範囲（min/max）を指定できるか",
+        minimum="準アドミンの範囲の最小値（禁止時は固定、許可時は省略時のデフォルト）",
+        maximum="準アドミンの範囲の最大値（禁止時は固定、許可時は省略時のデフォルト）",
+    )
+    @app_commands.rename(minimum="min", maximum="max")
+    async def subadmin_config(
+        self,
+        interaction: discord.Interaction,
+        allow_custom: Optional[bool] = None,
+        minimum: Optional[app_commands.Range[int, 0, 1000]] = None,
+        maximum: Optional[app_commands.Range[int, 0, 1000]] = None,
+    ):
+        if not await self._guard(interaction):
+            return
+        cur_lo, cur_hi = self._sub_range()
+        lo = minimum if minimum is not None else cur_lo
+        hi = maximum if maximum is not None else cur_hi
+        if lo > hi:
+            await interaction.response.send_message(
+                "min は max 以下にしてください。", ephemeral=True
+            )
+            return
+        if allow_custom is not None:
+            self._set_setting("sub_custom_allowed", int(allow_custom))
+        if minimum is not None or maximum is not None:
+            self._set_setting("sub_min", lo)
+            self._set_setting("sub_max", hi)
+        mode = "許可（自由に指定可）" if self._sub_custom_allowed() else "禁止（固定範囲のみ）"
+        await interaction.response.send_message(
+            f"準アドミンの設定\n範囲指定: {mode}\n範囲: {lo}〜{hi}", ephemeral=True
         )
 
     # ---------- target management ----------
