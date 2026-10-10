@@ -273,3 +273,139 @@ def describe_rules(mode: str, rules: Rules) -> list[str]:
                else "編集してもよいが、形式を外れたら削除")
     out.append("読みの指定は 漢字《かな》、守らない投稿は即削除")
     return out
+
+
+# ---------- /auto_verse: 周りの発言から短歌を作る ----------
+_CONTENT = {"名詞", "動詞", "形容詞", "副詞", "連体詞", "接続詞", "感動詞", "代名詞", "形状詞", "接頭辞"}
+_BREAK_AFTER = {"助詞", "助動詞", "接尾辞", "副詞", "連体詞", "接続詞", "感動詞"}
+
+Tok = tuple[str, str, str, str]  # (表層, 読み, 品詞1, 品詞2)
+
+
+def _segments(text: str) -> list[list[Tok]]:
+    """読める語の連続ごとに分割（記号・読めない語で区切る）"""
+    text = _URL.sub(" ", text)
+    text = _MENTION.sub(" ", text)
+    text = _CUSTOM_EMOJI.sub(" ", text)
+    segs, cur = [], []
+    for w in _tagger(text):
+        s = w.surface
+        kana = getattr(w.feature, "kana", None)
+        if kana in (None, "*", "") and re.fullmatch(r"[ァ-ヺー]+", to_katakana(s)):
+            kana = to_katakana(s)
+        if all(c in _PUNCT for c in s) or kana in (None, "*", ""):
+            if cur:
+                segs.append(cur)
+            cur = []
+            continue
+        cur.append((s, kana, w.feature.pos1 or "", w.feature.pos2 or ""))
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def _is_start(seg: list[Tok], i: int) -> bool:
+    """i 番目の語から新しい文節が始まるか（ここで句を切ってよいか）"""
+    if i == 0:
+        return seg[0][2] in _CONTENT
+    if i >= len(seg):
+        return True
+    cur, prev = seg[i], seg[i - 1]
+    if cur[2] not in _CONTENT:
+        return False
+    if prev[2] == "接頭辞":
+        return False
+    # 「〜ていく」「〜でいる」の補助動詞は前とひとまとまり
+    if cur[2] == "動詞" and cur[3] == "非自立可能" and prev[0] in ("て", "で"):
+        return False
+    # 名詞の連続（複合語）は切らない
+    if cur[2] == "名詞" and prev[2] == "名詞":
+        return False
+    return prev[2] in _BREAK_AFTER or prev[2] in ("名詞", "代名詞") or cur[2] in ("副詞", "接続詞")
+
+
+def phrases(text: str, lengths=(5, 7)) -> list[tuple[str, int]]:
+    """文中から文節の切れ目で切り出せる5音・7音の句を列挙する。(句, 音数)"""
+    out = []
+    for seg in _segments(text):
+        for i in range(len(seg)):
+            if not _is_start(seg, i):
+                continue
+            n, surf = 0, ""
+            for j in range(i, len(seg)):
+                n += count_mora(seg[j][1])
+                surf += seg[j][0]
+                if n > max(lengths):
+                    break
+                # 「課題もう」「この」のように、修飾語で終わる宙ぶらりんな句は除く
+                dangling = seg[j][2] in ("連体詞", "接頭辞") or (seg[j][2] == "副詞" and j > i)
+                if n in lengths and _is_start(seg, j + 1) and not dangling:
+                    out.append((surf, n))
+    return out
+
+
+def accidental_tanka(text: str) -> Optional[list[str]]:
+    """1つの発言の中にそのまま 5・7・5・7・7 が隠れていれば返す（偶然短歌）"""
+    for seg in _segments(text):
+        for start in range(len(seg)):
+            if not _is_start(seg, start):
+                continue
+            lines, k = [], start
+            for need in TANKA_PATTERN:
+                surf, n = "", 0
+                while k < len(seg) and n < need:
+                    n += count_mora(seg[k][1])
+                    surf += seg[k][0]
+                    k += 1
+                if n != need or not _is_start(seg, k):
+                    break
+                lines.append(surf)
+            if len(lines) == len(TANKA_PATTERN):
+                return lines
+    return None
+
+
+def compose_tanka(texts: list[str], rng=None, tries: int = 400) -> Optional[dict]:
+    """発言のリスト（古い順）から短歌を作る。
+    まず1つの発言に隠れた偶然短歌を探し、なければ複数の発言から句を拾って会話の順に並べる。
+    戻り値: {"kind": "accidental"|"collage", "lines": [(句, 発言の番号), ...]}"""
+    import random
+    rng = rng or random.Random()
+
+    for idx in reversed(range(len(texts))):  # 新しい発言を優先
+        found = accidental_tanka(texts[idx])
+        if found:
+            return {"kind": "accidental", "lines": [(l, idx) for l in found]}
+
+    pools: dict[int, list[tuple[str, int]]] = {5: [], 7: []}
+    seen = set()
+    for idx, t in enumerate(texts):
+        for surf, n in phrases(t):
+            if (surf, idx) not in seen:
+                seen.add((surf, idx))
+                pools[n].append((surf, idx))
+    if not pools[5] or len(pools[7]) < 2:
+        return None
+
+    def attempt(ordered: bool, one_per_msg: bool):
+        prev, picked, used, used_idx = -1, [], set(), set()
+        for need in TANKA_PATTERN:
+            opts = [c for c in pools[need] if c[0] not in used
+                    and (not one_per_msg or c[1] not in used_idx)
+                    and (not ordered or c[1] > prev)]
+            if not opts:
+                return None
+            c = rng.choice(opts)
+            picked.append(c)
+            used.add(c[0])
+            used_idx.add(c[1])
+            prev = c[1]
+        return picked
+
+    # 会話の順・1発言1句 → 順不同・1発言1句 → 順不同・同じ発言から複数句 の順に妥協する
+    for ordered, one in ((True, True), (False, True), (False, False)):
+        for _ in range(tries):
+            picked = attempt(ordered, one)
+            if picked:
+                return {"kind": "collage", "lines": picked}
+    return None

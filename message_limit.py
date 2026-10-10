@@ -20,6 +20,7 @@ message_limit.py - 特定ユーザーの発言を制限する Cog (discord.py 2.
 import asyncio
 import os
 import random
+import time
 import sqlite3
 from datetime import datetime
 from typing import Optional
@@ -45,6 +46,8 @@ TZ = ZoneInfo("Asia/Tokyo")  # 日付の切り替え基準（0:00 JST）
 DB_PATH = os.getenv("DB_PATH", "message_limit.db")  # Railwayでは Volume 配下を指定
 HISTORY_SCAN_LIMIT = 300  # 短歌/詩人モードで遡って読む最大メッセージ数
 ANNOUNCE_COMPLETE = True  # 一首（一連）が完成したら全文を投稿する
+AUTO_VERSE_DEFAULT = 100  # /auto_verse で遡る既定のメッセージ数
+AUTO_VERSE_COOLDOWN = 30  # /auto_verse のチャンネルごとのクールダウン（秒）
 MODE_LABEL = {"normal": "通常", "tanka": "短歌モード", "poet": "詩人モード"}
 # ============================================
 
@@ -106,6 +109,7 @@ class MessageLimit(commands.Cog):
         }
         self._notified: set[tuple[int, str]] = set()
         self._verse_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self._auto_verse_last: dict[int, float] = {}
 
     def cog_unload(self):
         self.db.close()
@@ -399,6 +403,78 @@ class MessageLimit(commands.Cog):
             )
         except discord.HTTPException:
             pass
+
+    # ---------- /auto_verse ----------
+    @app_commands.command(name="auto_verse", description="このチャンネルの最近の発言を集めて短歌にします")
+    @app_commands.describe(
+        count=f"遡るメッセージ数（10〜500、省略時は{AUTO_VERSE_DEFAULT}）",
+        user="この人の発言だけで詠む",
+    )
+    async def auto_verse(
+        self,
+        interaction: discord.Interaction,
+        count: Optional[app_commands.Range[int, 10, 500]] = None,
+        user: Optional[discord.User] = None,
+    ):
+        ch = interaction.channel
+        if ch is None or not hasattr(ch, "history"):
+            await interaction.response.send_message("このチャンネルでは使えません。", ephemeral=True)
+            return
+        now = time.monotonic()
+        wait = AUTO_VERSE_COOLDOWN - (now - self._auto_verse_last.get(ch.id, -1e9))
+        if wait > 0 and not self._is_admin(interaction.user.id):
+            await interaction.response.send_message(
+                f"歌を詠むには少し間をおいてください（あと{int(wait) + 1}秒）。", ephemeral=True
+            )
+            return
+        self._auto_verse_last[ch.id] = now
+        await interaction.response.defer(thinking=True)
+
+        limit = count or AUTO_VERSE_DEFAULT
+        try:
+            msgs = [
+                m async for m in ch.history(limit=limit)
+                if not m.author.bot and m.content.strip()
+                and not m.content.startswith(("/", "!"))
+                and (user is None or m.author.id == user.id)
+            ]
+        except discord.Forbidden:
+            await interaction.followup.send("このチャンネルの履歴を読む権限がありません。")
+            return
+        msgs.reverse()  # 古い順
+        result = await asyncio.to_thread(verse.compose_tanka, [m.content for m in msgs])
+        if result is None:
+            who = f"{user.display_name} の" if user else ""
+            await interaction.followup.send(
+                f"直近{limit}件の{who}発言からは、5音・7音の句が足りず短歌になりませんでした。"
+                "もう少し会話が進んでからお試しください。"
+            )
+            return
+
+        lines = []
+        for text, idx in result["lines"]:
+            m = msgs[idx]
+            lines.append(f"{text}　— [{m.author.display_name}]({m.jump_url})")
+        if result["kind"] == "accidental":
+            m = msgs[result["lines"][0][1]]
+            title = "🎯 偶然短歌を見つけました"
+            desc = "\n".join(t for t, _ in result["lines"])
+            footer = f"{m.author.display_name} の発言がそのまま 5・7・5・7・7 でした"
+            embed = discord.Embed(title=title, description=desc, color=0xE67E22, url=m.jump_url)
+        else:
+            authors = []
+            for _, idx in result["lines"]:
+                n = msgs[idx].author.display_name
+                if n not in authors:
+                    authors.append(n)
+            embed = discord.Embed(
+                title="🎋 みんなの言葉で一首",
+                description="\n".join(lines),
+                color=0x27AE60,
+            )
+            footer = f"詠み人: {'・'.join(authors)}（直近{limit}件の発言より）"
+        embed.set_footer(text=footer)
+        await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     # ---------- commands ----------
     @app_commands.command(name="roulette", description="今日の上限回数をランダムで決めます")
