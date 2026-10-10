@@ -1,1 +1,3 @@
 discord.py>=2.4
+fugashi>=1.3
+unidic-lite>=1.0.8

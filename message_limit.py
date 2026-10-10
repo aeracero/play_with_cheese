@@ -8,11 +8,16 @@ message_limit.py - 特定ユーザーの発言を制限する Cog (discord.py 2.
   - 操作できるのは AUTHORIZED_USER_IDS と /limitadmin add で追加した人のみ
   - 制限対象は TARGET_USER_IDS（埋め込み）と /limittarget add で追加した人
   - 準アドミン: /roulette だけ使える人。範囲指定の可否と固定範囲はアドミンが /subadmin config で設定
+  - 短歌モード / 詩人モード（/versemode）: 回数・文字数制限なしの代わりに、
+    1メッセージ = 1句（5・7・5・7・7）/ 1行（七五調・脚韻）で投稿しなければ削除。
+    厳しさ（非常に厳しい / 厳しい / 普通 / 優しめ）をユーザーごとに設定できる。
+    投稿のたびにそのチャンネルの過去の投稿を読み直し、何句目か・ルールを守れているかを確認する
 
 必要な権限: Manage Messages / View Channels / Send Messages / Read Message History
 必要な intent: Message Content Intent（文字数制限に必要。Developer Portal でも有効化）
 """
 
+import asyncio
 import os
 import random
 import sqlite3
@@ -23,6 +28,8 @@ from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+import verse
 
 # ===== 設定（ここを書き換えてください） =====
 TARGET_USER_IDS = {1418847343003832351}   # 制限対象のユーザーID（複数可）
@@ -36,6 +43,9 @@ ROULETTE_MAX = 30       # /roulette のデフォルト最大値
 MAX_CHARS = 200         # 1メッセージの最大文字数（0で無制限）
 TZ = ZoneInfo("Asia/Tokyo")  # 日付の切り替え基準（0:00 JST）
 DB_PATH = os.getenv("DB_PATH", "message_limit.db")  # Railwayでは Volume 配下を指定
+HISTORY_SCAN_LIMIT = 300  # 短歌/詩人モードで遡って読む最大メッセージ数
+ANNOUNCE_COMPLETE = True  # 一首（一連）が完成したら全文を投稿する
+MODE_LABEL = {"normal": "通常", "tanka": "短歌モード", "poet": "詩人モード"}
 # ============================================
 
 
@@ -53,6 +63,9 @@ class MessageLimit(commands.Cog):
     )
     limittarget = app_commands.Group(
         name="limittarget", description="制限対象のユーザーを管理します"
+    )
+    versemode = app_commands.Group(
+        name="versemode", description="短歌モード・詩人モードを管理します"
     )
 
     def __init__(self, bot: commands.Bot):
@@ -74,14 +87,25 @@ class MessageLimit(commands.Cog):
                 user_id INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS sub_admins (
                 user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS modes (
+                user_id INTEGER PRIMARY KEY, mode TEXT, since_id INTEGER);
+            CREATE TABLE IF NOT EXISTS verse_anchors (
+                user_id INTEGER, channel_id INTEGER, anchor_id INTEGER,
+                PRIMARY KEY (user_id, channel_id));
             """
         )
+        # 旧バージョンのDBに厳しさの列を追加
+        try:
+            self.db.execute("ALTER TABLE modes ADD COLUMN strictness TEXT")
+        except sqlite3.OperationalError:
+            pass
         self.db.commit()
         # 制限対象（埋め込み + コマンド追加分）。メッセージごとのDB参照を避けるためキャッシュ
         self._db_targets: set[int] = {
             r[0] for r in self.db.execute("SELECT user_id FROM targets")
         }
         self._notified: set[tuple[int, str]] = set()
+        self._verse_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
     def cog_unload(self):
         self.db.close()
@@ -145,6 +169,40 @@ class MessageLimit(commands.Cog):
     def _db_admin_ids(self) -> set[int]:
         return {r[0] for r in self.db.execute("SELECT user_id FROM admins")}
 
+    def _get_mode(self, uid: int) -> tuple[str, int, str]:
+        """(モード, 数え始めのメッセージID, 厳しさ)"""
+        row = self.db.execute(
+            "SELECT mode, since_id, strictness FROM modes WHERE user_id=?", (uid,)
+        ).fetchone()
+        if not row:
+            return ("normal", 0, verse.DEFAULT_STRICTNESS)
+        level = row[2] if row[2] in verse.STRICTNESS else verse.DEFAULT_STRICTNESS
+        return (row[0], row[1], level)
+
+    def _save_mode(self, uid: int, mode: str, level: str) -> None:
+        # 切り替えた瞬間より後の投稿だけを数える（途中の歌はリセット）
+        since_id = discord.utils.time_snowflake(discord.utils.utcnow())
+        self.db.execute(
+            "INSERT OR REPLACE INTO modes (user_id, mode, since_id, strictness) VALUES (?, ?, ?, ?)",
+            (uid, mode, since_id, level),
+        )
+        self.db.execute("DELETE FROM verse_anchors WHERE user_id=?", (uid,))
+        self.db.commit()
+
+    def _get_anchor(self, uid: int, channel_id: int) -> int:
+        row = self.db.execute(
+            "SELECT anchor_id FROM verse_anchors WHERE user_id=? AND channel_id=?",
+            (uid, channel_id),
+        ).fetchone()
+        return row[0] if row else 0
+
+    def _set_anchor(self, uid: int, channel_id: int, anchor_id: int) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO verse_anchors (user_id, channel_id, anchor_id) VALUES (?, ?, ?)",
+            (uid, channel_id, anchor_id),
+        )
+        self.db.commit()
+
     # ---------- permission ----------
     def _is_admin(self, uid: int) -> bool:
         return uid in AUTHORIZED_USER_IDS or uid in self._db_admin_ids()
@@ -165,6 +223,11 @@ class MessageLimit(commands.Cog):
             return
         uid = message.author.id
         if uid not in self._target_ids():
+            return
+
+        mode, since_id, level = self._get_mode(uid)
+        if mode != "normal":
+            await self._handle_verse(message, mode, since_id, level)
             return
 
         # 1) 文字数制限（超過分は回数にカウントしない）
@@ -207,6 +270,135 @@ class MessageLimit(commands.Cog):
                 )
             except discord.HTTPException:
                 pass
+
+    # ---------- verse mode ----------
+    async def _verse_state(self, message: discord.Message, mode: str, since_id: int,
+                           rules: "verse.Rules", edited: bool = False):
+        """前回完成した一首（一連）以降のこの人の投稿を読み直し、今どこまで詠んだかを返す。
+        ルール違反の句や、制限時間切れの未完成の歌はここで削除する。"""
+        uid, ch = message.author.id, message.channel
+        cycle = verse.cycle_length(mode)
+        # 編集の再判定は、完成済みの歌の中の句かもしれないのでモード開始から読み直す
+        anchor = since_id if edited else max(self._get_anchor(uid, ch.id), since_id)
+        try:
+            history = [
+                m async for m in ch.history(
+                    limit=HISTORY_SCAN_LIMIT, after=discord.Object(id=anchor),
+                    before=message, oldest_first=True,
+                )
+                if m.author.id == uid
+            ]
+        except discord.HTTPException:
+            history = []
+
+        partial: list[tuple[discord.Message, str]] = []  # (メッセージ, 読み)
+        rhyme = None
+        expired = False
+
+        async def drop(msgs):
+            for m in msgs:
+                try:
+                    await m.delete()
+                except (discord.Forbidden, discord.NotFound):
+                    pass
+
+        for m in history + [message]:
+            # 制限時間: 前の句から時間が空きすぎたら未完成の歌を破棄
+            if rules.time_limit_min and partial:
+                gap = (m.created_at - partial[-1][0].created_at).total_seconds()
+                if gap > rules.time_limit_min * 60:
+                    await drop([pm for pm, _ in partial])
+                    partial, rhyme, expired = [], None, True
+            if m is message:
+                break
+            r = verse.check(mode, m.content, len(partial), rules, rhyme,
+                            [k for _, k in partial], bool(m.attachments or m.stickers))
+            if not r.ok:
+                await drop([m])  # 取りこぼし（bot停止中の投稿など）
+                continue
+            partial.append((m, r.reading))
+            rhyme = r.rhyme if r.rhyme else rhyme
+            if len(partial) == cycle:
+                if not edited:
+                    self._set_anchor(uid, ch.id, m.id)
+                partial, rhyme = [], None
+        return partial, rhyme, expired
+
+    async def _handle_verse(self, message: discord.Message, mode: str, since_id: int,
+                            level: str, edited: bool = False):
+        uid, ch = message.author.id, message.channel
+        rules = verse.STRICTNESS[level]
+        lock = self._verse_locks.setdefault((uid, ch.id), asyncio.Lock())
+        async with lock:
+            partial, rhyme, expired = await self._verse_state(
+                message, mode, since_id, rules, edited)
+            pos = len(partial)
+            r = verse.check(mode, message.content, pos, rules, rhyme,
+                            [k for _, k in partial],
+                            bool(message.attachments or message.stickers))
+            notes = []
+            if expired:
+                notes.append(f"前の句から{rules.time_limit_min}分以上空いたため、"
+                             "未完成の歌は消えました。最初から詠み直しです")
+            if r.ok:
+                if pos + 1 == verse.cycle_length(mode) and not edited:
+                    self._set_anchor(uid, ch.id, message.id)
+                    if ANNOUNCE_COMPLETE:
+                        title = "🎋 一首できました" if mode == "tanka" else "📜 一連できました"
+                        lines = [pm.content for pm, _ in partial] + [message.content]
+                        try:
+                            await ch.send(
+                                f"{title}（{message.author.display_name}）\n" + "\n".join(lines),
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        except discord.HTTPException:
+                            pass
+                if notes:
+                    try:
+                        await ch.send(f"{message.author.mention} " + notes[0], delete_after=10)
+                    except discord.HTTPException:
+                        pass
+                return
+
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.NotFound):
+                return
+            head = f"【{MODE_LABEL[mode]}・{rules.label}】"
+            if expired:
+                pos, rhyme = 0, None
+            try:
+                await ch.send(
+                    f"{message.author.mention} {head}{verse.expected_hint(mode, pos, rhyme)}\n"
+                    + "\n".join(f"・{e}" for e in notes + r.errors),
+                    delete_after=12,
+                )
+            except discord.HTTPException:
+                pass
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        if after.author.bot or after.guild is None or before.content == after.content:
+            return
+        if after.author.id not in self._target_ids():
+            return
+        mode, since_id, level = self._get_mode(after.author.id)
+        if mode == "normal" or after.id <= since_id:
+            return
+        rules = verse.STRICTNESS[level]
+        if rules.edit_policy == "recheck":
+            # 編集後の内容を、その句の位置のルールでもう一度判定（違反なら削除）
+            await self._handle_verse(after, mode, since_id, level, edited=True)
+            return
+        try:
+            await after.delete()
+            await after.channel.send(
+                f"{after.author.mention} 【{MODE_LABEL[mode]}・{rules.label}】編集は禁止です。"
+                "編集した句は削除しました（その句から詠み直してください）。",
+                delete_after=10,
+            )
+        except discord.HTTPException:
+            pass
 
     # ---------- commands ----------
     @app_commands.command(name="roulette", description="今日の上限回数をランダムで決めます")
@@ -299,15 +491,125 @@ class MessageLimit(commands.Cog):
             return
         date = today()
         max_chars = self._get_max_chars()
-        lines = [
-            f"<@{uid}>: 今日 {self._get_count(uid, date)} / {self._get_limit(uid, date)} 件"
-            for uid in sorted(self._target_ids())
-        ]
+        lines = []
+        for uid in sorted(self._target_ids()):
+            mode, _, level = self._get_mode(uid)
+            if mode == "normal":
+                lines.append(
+                    f"<@{uid}>: 今日 {self._get_count(uid, date)} / {self._get_limit(uid, date)} 件"
+                )
+            else:
+                lines.append(f"<@{uid}>: {MODE_LABEL[mode]}・{verse.STRICTNESS[level].label}"
+                             "（回数制限なし）")
         lines.append(f"文字数制限: {'なし' if max_chars == 0 else f'{max_chars}文字'}")
         await interaction.response.send_message(
             "\n".join(lines),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # ---------- verse mode management ----------
+    _STRICT_CHOICES = [
+        app_commands.Choice(name="非常に厳しい", value="very_strict"),
+        app_commands.Choice(name="厳しい", value="strict"),
+        app_commands.Choice(name="普通", value="normal"),
+        app_commands.Choice(name="優しめ", value="gentle"),
+    ]
+
+    async def _announce(self, interaction: discord.Interaction, user: discord.User,
+                        mode: str, level: str, changed_level_only: bool = False):
+        """モード指定時の公開アナウンス"""
+        rules = verse.STRICTNESS[level]
+        name = getattr(user, "display_name", user.name)
+        if mode == "normal":
+            embed = discord.Embed(
+                title=f"🕊️ {name} は本日から普通の人に戻ります",
+                description="通常の回数・文字数制限に戻りました。",
+                color=0x95A5A6,
+            )
+        else:
+            if changed_level_only:
+                title = f"⚖️ {name} の掟が「{rules.label}」に変わりました"
+            elif mode == "poet":
+                title = f"📜 {name} は本日から詩人になります！"
+            else:
+                title = f"🎋 {name} は本日から歌人になります！"
+            embed = discord.Embed(
+                title=title,
+                description="発言回数は無制限。その代わり、次の掟を守ること。",
+                color=0x8E44AD if mode == "poet" else 0x27AE60,
+            )
+            embed.add_field(
+                name=f"厳しさ: {rules.label}",
+                value="\n".join(f"・{x}" for x in verse.describe_rules(mode, rules)),
+                inline=False,
+            )
+        await interaction.response.send_message(
+            content=user.mention,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=[user]),
+        )
+
+    @versemode.command(name="set", description="制限対象のユーザーのモードを切り替えます")
+    @app_commands.describe(user="対象ユーザー", mode="モード", strictness="ルールの厳しさ（省略時は今の設定、初回は「厳しい」）")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="通常（回数制限）", value="normal"),
+        app_commands.Choice(name="短歌モード（5・7・5・7・7）", value="tanka"),
+        app_commands.Choice(name="詩人モード（七五調・脚韻）", value="poet"),
+    ], strictness=_STRICT_CHOICES)
+    async def versemode_set(
+        self, interaction: discord.Interaction, user: discord.User,
+        mode: app_commands.Choice[str],
+        strictness: Optional[app_commands.Choice[str]] = None,
+    ):
+        if not await self._guard(interaction):
+            return
+        if user.id not in self._target_ids():
+            await interaction.response.send_message(
+                "このユーザーは制限対象ではありません（/limittarget add で追加できます）。",
+                ephemeral=True,
+            )
+            return
+        level = strictness.value if strictness else self._get_mode(user.id)[2]
+        self._save_mode(user.id, mode.value, level)
+        await self._announce(interaction, user, mode.value, level)
+
+    @versemode.command(name="strictness", description="ルールの厳しさだけを変更します（詠みかけの歌はリセット）")
+    @app_commands.describe(user="対象ユーザー", level="厳しさ")
+    @app_commands.choices(level=_STRICT_CHOICES)
+    async def versemode_strictness(
+        self, interaction: discord.Interaction, user: discord.User,
+        level: app_commands.Choice[str],
+    ):
+        if not await self._guard(interaction):
+            return
+        if user.id not in self._target_ids():
+            await interaction.response.send_message(
+                "このユーザーは制限対象ではありません。", ephemeral=True
+            )
+            return
+        mode = self._get_mode(user.id)[0]
+        self._save_mode(user.id, mode, level.value)
+        if mode == "normal":
+            await interaction.response.send_message(
+                f"{user.mention} の厳しさを「{level.name}」にしました"
+                "（短歌・詩人モードにしたときに適用されます）。",
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await self._announce(interaction, user, mode, level.value, changed_level_only=True)
+
+    @versemode.command(name="list", description="各ユーザーの現在のモードと厳しさを表示します")
+    async def versemode_list(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        rows = []
+        for u in sorted(self._target_ids()):
+            mode, _, level = self._get_mode(u)
+            rows.append(f"- <@{u}>: {MODE_LABEL[mode]}（厳しさ: {verse.STRICTNESS[level].label}）")
+        await interaction.response.send_message(
+            "\n".join(rows) or "制限対象のユーザーはいません。",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
         )
 
     # ---------- sub-admin management ----------
